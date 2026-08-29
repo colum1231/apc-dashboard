@@ -41,7 +41,7 @@ export default async function CommandCentre() {
             <Table>
               <thead><tr>
                 <Th>Member</Th><Th>Tier</Th><Th className="text-right">Amount</Th>
-                <Th>Term end</Th><Th className="text-right">Days</Th><Th />
+                <Th>Term end</Th><Th className="text-right">Days</Th><Th><span className="sr-only">Actions</span></Th>
               </tr></thead>
               <tbody>
                 {renewals.map((r) => {
