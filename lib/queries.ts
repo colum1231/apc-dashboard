@@ -253,3 +253,23 @@ export async function getMonthlyCashVsContract() {
   });
   return Object.values(months);
 }
+
+export type DigestRow = {
+  id: string;
+  generated_at: string;
+  summary: string | null;
+  items: any[];
+};
+
+/** Most recent digest row. Null when none has been generated yet. */
+export async function getLatestDigest(): Promise<DigestRow | null> {
+  const supabase = createClient();
+  const { data, error } = await supabase
+    .from('daily_digest')
+    .select('id, generated_at, summary, items')
+    .order('generated_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) return null;
+  return (data as DigestRow) ?? null;
+}
