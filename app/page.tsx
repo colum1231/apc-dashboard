@@ -1,10 +1,11 @@
 import { Stat, Panel, Notice, Table, Th, Td, Empty, Badge, UnverifiedName } from '@/components/ui';
 import { GrowthChart, AttributionBars } from '@/components/charts';
 import { FlagButton } from '@/components/flag-button';
+import { DigestCard } from '@/components/digest-card';
 import { getRole, canSeeRepComp } from '@/lib/auth';
 import {
   getActiveMembers, getLiveContractValue, getCashThisMonth, getNetNewThisMonth,
-  getGrowthSeries, getRenewals, getRepLeaderboard, getAttribution,
+  getGrowthSeries, getRenewals, getRepLeaderboard, getAttribution, getLatestDigest,
 } from '@/lib/queries';
 import { eur, num, shortDate, daysBetween, displayName, nameUnverified, monthBounds } from '@/lib/format';
 
@@ -14,14 +15,16 @@ export default async function CommandCentre() {
   const { role } = await getRole();
   const { start, end } = monthBounds();
 
-  const [members, lcv, cash, netNew, growth, renewals, reps, attribution] = await Promise.all([
+  const [members, lcv, cash, netNew, growth, renewals, reps, attribution, digest] = await Promise.all([
     getActiveMembers(), getLiveContractValue(), getCashThisMonth(), getNetNewThisMonth(),
     getGrowthSeries(), getRenewals(30), getRepLeaderboard(),
-    getAttribution(start.slice(0, 10), end.slice(0, 10)),
+    getAttribution(start.slice(0, 10), end.slice(0, 10)), getLatestDigest(),
   ]);
 
   return (
     <div className="space-y-5">
+      <DigestCard digest={digest as any} />
+
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <Stat label="Net new this month" value={num(netNew)} sub="Terms starting this calendar month" />
         <Stat label="Active members" value={num(members.length)} sub="Live from v_active_members" />
