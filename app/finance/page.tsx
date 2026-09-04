@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { Panel, Table, Th, Td, Stat, Badge, Notice, UnverifiedName, Empty } from '@/components/ui';
 import { CashVsContract } from '@/components/charts';
-import { getMonthlyCashVsContract, getDataQuality } from '@/lib/queries';
+import { getMonthlyCashVsContract, getDataQuality, getNewVsRenewal, getRenewalBoundaryDrift } from '@/lib/queries';
 import { createClient } from '@/lib/supabase/server';
 import { eur, num, shortDate, daysBetween, displayName, nameUnverified } from '@/lib/format';
 
@@ -14,17 +14,22 @@ export const dynamic = 'force-dynamic';
 const SCHEMA_DEBT = [
   { item: 'instalment_group unpopulated', detail: 'Column exists on transactions but is not written by any pipeline.' },
   { item: 'transaction_id single column', detail: 'membership_terms.transaction_id holds one id; split payments cannot be represented.' },
-  { item: '14-month term rule unconfirmed', detail: '344 of 345 existing terms are 12 months. The single 14-month row looks like the bug.' },
+  { item: 'One stray 14-month term', detail: '346 of 347 terms are 12 months. 12 is the standard; the single 14-month row created 2026-08-27 is an outlier to correct.' },
   { item: 'RLS on backup tables', detail: 'membership_terms_backup_20260826 and the 20260828 set have RLS disabled.' },
+  { item: 'Ad-level attribution coverage', detail: 'Only 12 of 645 Meta ads have any application attached. Most ad spend has no lead figure.' },
 ];
 
 export default async function FinancePage() {
   const supabase = createClient();
-  const [monthly, dq, { data: terms }] = await Promise.all([
+  const [monthly, dq, split, drift, { data: terms }] = await Promise.all([
     getMonthlyCashVsContract(),
     getDataQuality(),
+    getNewVsRenewal(),
+    getRenewalBoundaryDrift(),
     supabase.from('membership_terms').select('term_start, amount_eur, status'),
   ]);
+
+  const driftTotal = drift.reduce((t, d) => t + Number(d.term_count ?? 0), 0);
 
   const outstanding = dq.deposits.reduce((t: number, d: any) => {
     const full = parseFullValue(d.extension_note);
@@ -45,6 +50,93 @@ export default async function FinancePage() {
 
   return (
     <div className="space-y-5">
+      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        <Stat label="ARR (annualised)" value={eur(split.arr)} sub="Each term annualised on its own length, not assumed 12m" />
+        <Stat label="Live contract value" value={eur(split.live_contract_value)} sub={`${num(split.live_terms)} live terms`} />
+        <Stat label="Average term value" value={eur(split.avg_term_value)} sub="Across the live book" />
+        <Stat
+          label="New vs renewal"
+          value={`${num(split.live_new)} / ${num(split.live_renewal)}`}
+          sub="Live terms: first-time vs returning"
+        />
+      </div>
+
+      <Panel title="Not computed — and why" hint="Shown rather than estimated">
+        <ul className="space-y-2.5 text-sm">
+          <li className="flex items-start justify-between gap-4 border-b border-edge pb-2.5">
+            <div>
+              <p>CAC</p>
+              <p className="mt-0.5 text-xs text-muted">
+                Meta spend is now ad-level and daily, but only 12 of 645 ads have applications attached
+                and 97.7% of transactions carry no source. The denominator is still missing.
+              </p>
+            </div>
+            <Badge tone="warn">uncomputable</Badge>
+          </li>
+          <li className="flex items-start justify-between gap-4 border-b border-edge pb-2.5">
+            <div>
+              <p>LTV</p>
+              <p className="mt-0.5 text-xs text-muted">
+                Needs retention across full cycles. Renewal outcomes have only been tracked since 4 Sep 2026.
+              </p>
+            </div>
+            <Badge tone="warn">uncomputable</Badge>
+          </li>
+          <li className="flex items-start justify-between gap-4 border-b border-edge pb-2.5">
+            <div>
+              <p>Gross margin</p>
+              <p className="mt-0.5 text-xs text-muted">
+                No cost data in this database. Zoho Books is not connected, so there is no
+                cost of delivery to subtract.
+              </p>
+            </div>
+            <Badge tone="warn">uncomputable</Badge>
+          </li>
+          <li className="flex items-start justify-between gap-4 border-b border-edge pb-2.5">
+            <div>
+              <p>Cash position</p>
+              <p className="mt-0.5 text-xs text-muted">
+                No bank balance feed. Cash collected is tracked; the actual balance is not.
+              </p>
+            </div>
+            <Badge tone="warn">uncomputable</Badge>
+          </li>
+          <li className="flex items-start justify-between gap-4">
+            <div>
+              <p>Renewal conversion rate</p>
+              <p className="mt-0.5 text-xs text-muted">
+                Churn itself is computable from membership_terms back to Aug 2024. What is missing is
+                whether a lapse was chased and lost, or never chased.
+              </p>
+            </div>
+            <Badge tone="warn">uncomputable</Badge>
+          </li>
+        </ul>
+      </Panel>
+
+      {driftTotal > 0 && (
+        <Panel title="Renewal boundary drift" hint="180-day cutoff, checked live">
+          <Table>
+            <thead><tr><Th>Rule</Th><Th className="text-right">Terms out of bounds</Th></tr></thead>
+            <tbody>
+              {drift.map((d) => (
+                <tr key={d.action} className="border-t border-edge">
+                  <Td className="text-muted">{d.action.replace(/_/g, ' ')}</Td>
+                  <Td className="tnum text-right"><Badge tone={d.term_count > 0 ? 'warn' : 'good'}>{num(d.term_count)}</Badge></Td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+          <div className="mt-4">
+            <Notice>
+              The 180-day cutoff runs nightly at 01:00 UTC via pg_cron. Anything showing here drifted
+              out of bounds since the last run and will clear on the next one. A persistently non-zero
+              count means the job has stopped.
+            </Notice>
+          </div>
+        </Panel>
+      )}
+
       <Panel title="Monthly cash vs contract value" hint="Last 12 months">
         <CashVsContract data={monthly} />
       </Panel>
