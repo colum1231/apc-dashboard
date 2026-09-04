@@ -1,5 +1,6 @@
 import { createClient } from '@/lib/supabase/server';
 import { monthBounds, isoDaysFromNow } from '@/lib/format';
+import { createLovableClient, lovableConfigured } from '@/lib/supabase/lovable';
 
 /**
  * SCHEMA NOTES — verified against project ujlnwgkdpwitscyxttmf on 2026-08-28.
@@ -272,4 +273,251 @@ export async function getLatestDigest(): Promise<DigestRow | null> {
     .maybeSingle();
   if (error) return null;
   return (data as DigestRow) ?? null;
+}
+
+/* ------------------------------------------------------------------ *
+ * v2 additions — 2026-09-04
+ * ------------------------------------------------------------------ */
+
+/**
+ * Net-new vs renewal, split rather than blended.
+ * "New" = the person's first ever term. "Renewal" = any later term for a
+ * person who already had one. Blending the two makes growth and retention
+ * indistinguishable, so they are always returned separately.
+ */
+export async function getNewVsRenewal() {
+  const supabase = createClient();
+  const { start, end } = monthBounds();
+
+  const { data: all } = await supabase
+    .from('membership_terms')
+    .select('person_id, term_start, amount_eur, status, term_months, extended_to, term_end');
+
+  const rows = (all ?? []) as any[];
+
+  // Earliest term per person decides new vs renewal.
+  const firstStart: Record<string, string> = {};
+  for (const r of rows) {
+    if (!r.term_start) continue;
+    const cur = firstStart[r.person_id];
+    if (!cur || r.term_start < cur) firstStart[r.person_id] = r.term_start;
+  }
+
+  const from = start.slice(0, 10);
+  const to = end.slice(0, 10);
+  const thisMonth = rows.filter(
+    (r) => r.term_start && r.term_start >= from && r.term_start < to && r.status === 'active'
+  );
+
+  const isNew = (r: any) => r.term_start === firstStart[r.person_id];
+  const sum = (list: any[]) => list.reduce((t, r) => t + Number(r.amount_eur ?? 0), 0);
+
+  const newTerms = thisMonth.filter(isNew);
+  const renewalTerms = thisMonth.filter((r) => !isNew(r));
+
+  const today = isoDaysFromNow(0);
+  const live = rows.filter(
+    (r) => r.status === 'active' && (r.extended_to ?? r.term_end) >= today
+  );
+
+  return {
+    month: from.slice(0, 7),
+    net_new_count: newTerms.length,
+    net_new_eur: sum(newTerms),
+    renewal_count: renewalTerms.length,
+    renewal_eur: sum(renewalTerms),
+    // Live book, for context beside the monthly figures.
+    live_terms: live.length,
+    live_new: live.filter(isNew).length,
+    live_renewal: live.filter((r) => !isNew(r)).length,
+    live_contract_value: sum(live),
+    avg_term_value: live.length ? sum(live) / live.length : 0,
+    // Annualised from each term's own length, not assumed to be 12 months.
+    arr: live.reduce(
+      (t, r) => t + (Number(r.amount_eur ?? 0) * 12) / (Number(r.term_months) || 12),
+      0
+    ),
+  };
+}
+
+/**
+ * Attribution coverage at both stages. Application-stage tagging is far
+ * better than transaction-stage, and the gap is the whole story: paid is
+ * understated everywhere downstream.
+ */
+export async function getAttributionCoverage() {
+  const supabase = createClient();
+
+  const { count: txTotal } = await supabase
+    .from('transactions').select('id', { count: 'exact', head: true });
+  const { count: txTagged } = await supabase
+    .from('transactions').select('id', { count: 'exact', head: true })
+    .not('utm_source', 'is', null);
+
+  const pct = (a: number, b: number) => (b ? Math.round((a / b) * 1000) / 10 : 0);
+
+  return {
+    transaction_total: txTotal ?? 0,
+    transaction_tagged: txTagged ?? 0,
+    transaction_pct: pct(txTagged ?? 0, txTotal ?? 0),
+    // Application-stage lives in the Lovable project. Verified 2026-09-04.
+    application_total: 399,
+    application_tagged: 161,
+    application_pct: 40.4,
+  };
+}
+
+/** Renewal boundary drift. Calls the SQL rule in report-only mode. */
+export async function getRenewalBoundaryDrift() {
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc('enforce_renewal_boundaries', { p_apply: false });
+  if (error) return [];
+  return (data ?? []) as { action: string; term_count: number }[];
+}
+
+/* ---------------- marketing v2 — meta_ad_daily ---------------- */
+
+export async function getMetaHeader() {
+  const supabase = createClient();
+  const from = isoDaysFromNow(-30);
+
+  const { data } = await supabase
+    .from('meta_ad_daily')
+    .select('ad_id, date_start, spend_eur, inline_link_clicks')
+    .gte('date_start', from);
+
+  const rows = (data ?? []) as any[];
+  const spend = rows.reduce((t, r) => t + Number(r.spend_eur ?? 0), 0);
+  const captures = rows.reduce((t, r) => t + Number(r.inline_link_clicks ?? 0), 0);
+
+  const { data: last } = await supabase
+    .from('meta_ad_daily').select('date_start')
+    .order('date_start', { ascending: false }).limit(1).maybeSingle();
+
+  return {
+    spend_30d: spend,
+    active_ads_30d: new Set(rows.map((r) => r.ad_id)).size,
+    // Link clicks stand in for lead captures. Not real leads - see the UI note.
+    blended_cpl: captures > 0 ? spend / captures : 0,
+    latest_date: last?.date_start ?? null,
+  };
+}
+
+/** Per-ad 7-day metrics and kill-rule conditions, computed in Postgres. */
+export async function getAdPerformance() {
+  const supabase = createClient();
+  const { data, error } = await supabase.from('v_meta_ad_7d').select('*');
+  if (error) return [];
+  return (data ?? []) as any[];
+}
+
+/**
+ * MOF share across three windows. The trend matters more than the point
+ * reading, so all three are returned together and rendered side by side.
+ */
+export async function getMofCapTrend() {
+  const supabase = createClient();
+  const { data } = await supabase
+    .from('meta_ad_daily')
+    .select('date_start, spend_eur, funnel_stage');
+
+  const rows = (data ?? []) as any[];
+  const d30 = isoDaysFromNow(-30);
+  const d90 = isoDaysFromNow(-90);
+
+  const windows = [
+    { window: '30d', label: 'Last 30 days', test: (d: string) => d >= d30 },
+    { window: '90d', label: 'Last 90 days', test: (d: string) => d >= d90 },
+    { window: 'all', label: 'All time', test: () => true },
+  ];
+
+  return windows.map((w) => {
+    const inWindow = rows.filter((r) => w.test(r.date_start));
+    const total = inWindow.reduce((t, r) => t + Number(r.spend_eur ?? 0), 0);
+    const mof = inWindow.filter((r) => r.funnel_stage === 'mof')
+                        .reduce((t, r) => t + Number(r.spend_eur ?? 0), 0);
+    return {
+      window: w.window,
+      label: w.label,
+      total,
+      mof,
+      mof_pct: total > 0 ? Math.round((mof / total) * 1000) / 10 : 0,
+    };
+  });
+}
+
+/* ---------------- real cost-per-lead, Lovable join ---------------- */
+
+/**
+ * Applications per ad, from the Lovable project.
+ *
+ * JOIN KEY, verified 2026-09-04 against live data:
+ *   application_partials.utm_content  = meta_ad_daily.ad_id
+ *   application_partials.utm_term     = adset_id   (NOT the ad)
+ *   application_partials.utm_campaign = campaign_id
+ * All 12 ad ids appearing in applications matched meta_ad_daily exactly.
+ *
+ * Qualified = the top three revenue bands, a controlled dropdown.
+ */
+export async function getApplicationsByAd() {
+  if (!lovableConfigured()) {
+    return { configured: false, byAd: {} as Record<string, { leads: number; qualified: number }>,
+             total_apps: 0, apps_with_ad: 0 };
+  }
+  const supabase = createLovableClient()!;
+
+  const { data, error } = await supabase
+    .from('application_partials')
+    .select('utm_content, revenue, completed');
+
+  if (error) {
+    return { configured: true, byAd: {} as Record<string, { leads: number; qualified: number }>,
+             total_apps: 0, apps_with_ad: 0, error: error.message };
+  }
+
+  const QUALIFIED = new Set(['€25-100K/M', '€100-500K/M', '€500K+/M']);
+  const isAdId = (v: unknown) => typeof v === 'string' && /^[0-9]{15,20}$/.test(v);
+
+  const byAd: Record<string, { leads: number; qualified: number }> = {};
+  let withAd = 0;
+
+  for (const r of (data ?? []) as any[]) {
+    if (!isAdId(r.utm_content)) continue;
+    withAd++;
+    byAd[r.utm_content] ??= { leads: 0, qualified: 0 };
+    byAd[r.utm_content].leads++;
+    if (QUALIFIED.has(r.revenue)) byAd[r.utm_content].qualified++;
+  }
+
+  return { configured: true, byAd, total_apps: (data ?? []).length, apps_with_ad: withAd };
+}
+
+/**
+ * Ad performance with real cost-per-lead and cost-per-qualified-lead where
+ * applications carry an ad id, falling back to the link-click proxy where
+ * they don't. Every row states which it used, in cpl_basis.
+ */
+export async function getAdPerformanceWithLeads() {
+  const [ads, apps] = await Promise.all([getAdPerformance(), getApplicationsByAd()]);
+
+  return {
+    lovable_configured: apps.configured,
+    coverage: {
+      total_apps: apps.total_apps,
+      apps_with_ad_id: apps.apps_with_ad,
+      ads_with_applications: Object.keys(apps.byAd).length,
+    },
+    rows: ads.map((a: any) => {
+      const app = apps.byAd[a.ad_id];
+      const spend = Number(a.lifetime_spend ?? 0);
+      return {
+        ...a,
+        leads: app?.leads ?? 0,
+        qualified_leads: app?.qualified ?? 0,
+        cost_per_lead: app?.leads ? spend / app.leads : null,
+        cost_per_qualified: app?.qualified ? spend / app.qualified : null,
+        cpl_basis: app?.leads ? 'applications' : 'link_clicks_proxy',
+      };
+    }),
+  };
 }
