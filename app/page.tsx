@@ -5,7 +5,7 @@ import { DigestCard } from '@/components/digest-card';
 import { getRole, canSeeRepComp } from '@/lib/auth';
 import {
   getActiveMembers, getLiveContractValue, getCashThisMonth, getNetNewThisMonth,
-  getGrowthSeries, getRenewals, getRepLeaderboard, getAttribution, getLatestDigest,
+  getGrowthSeries, getRenewals, getRepLeaderboard, getAttribution, getLatestDigest, getNewVsRenewal,
 } from '@/lib/queries';
 import { eur, num, shortDate, daysBetween, displayName, nameUnverified, monthBounds } from '@/lib/format';
 
@@ -21,14 +21,24 @@ export default async function CommandCentre() {
     getAttribution(start.slice(0, 10), end.slice(0, 10)), getLatestDigest(),
   ]);
 
+  const split = await getNewVsRenewal();
+
   return (
     <div className="space-y-5">
       <DigestCard digest={digest as any} />
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Stat label="Net new this month" value={num(netNew)} sub="Terms starting this calendar month" />
+        <Stat
+          label="Net new this month"
+          value={eur(split.net_new_eur)}
+          sub={`${num(split.net_new_count)} first-time member${split.net_new_count === 1 ? '' : 's'} — excludes renewals`}
+        />
+        <Stat
+          label="Renewals this month"
+          value={eur(split.renewal_eur)}
+          sub={`${num(split.renewal_count)} returning member${split.renewal_count === 1 ? '' : 's'} — kept separate from net new`}
+        />
         <Stat label="Active members" value={num(members.length)} sub="Live from v_active_members" />
-        <Stat label="Live contract value" value={eur(lcv.live_contract_value_eur)} sub={`${num(lcv.live_terms)} live terms`} />
         <Stat label="Cash this month" value={eur(cash)} sub="Members Club Revenue, cash collected date" />
       </div>
 
@@ -81,8 +91,10 @@ export default async function CommandCentre() {
         <Panel title="Source attribution" hint="Current month">
           <div className="mb-4">
             <Notice>
-              UTM data from Whop is currently empty. {attribution.tagged} of {attribution.total} transactions this
-              month carry a source — everything else counts as unknown.
+              Paid is understated everywhere. Whop returns no acquisition data at all, so tagging
+              is only 2.3% at transaction stage ({attribution.tagged} of {attribution.total} this month)
+              and 40% at application stage. Everything untagged counts as unknown, which means
+              organic and direct are both overstated here.
             </Notice>
           </div>
           <AttributionBars data={attribution.rows} />
