@@ -139,4 +139,143 @@ export default async function MarketingPage() {
         <Table>
           <thead><tr>
             <Th>Window</Th><Th className="text-right">Total spend</Th>
-            <Th className="text-right">MOF spend</Th><Th
+            <Th className="text-right">MOF spend</Th><Th className="text-right">MOF share</Th><Th>vs 15–25%</Th>
+          </tr></thead>
+          <tbody>
+            {cap.map((c) => (
+              <tr key={c.window} className="border-t border-edge">
+                <Td>{c.label}</Td>
+                <Td className="tnum text-right">{eur(c.total)}</Td>
+                <Td className="tnum text-right">{eur(c.mof)}</Td>
+                <Td className="tnum text-right">{c.mof_pct}%</Td>
+                <Td>
+                  <Badge tone={c.mof_pct > 25 ? 'bad' : c.mof_pct < 15 ? 'warn' : 'good'}>
+                    {c.mof_pct > 25 ? 'over' : c.mof_pct < 15 ? 'under' : 'in band'}
+                  </Badge>
+                </Td>
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      </Panel>
+
+      <Panel
+        title="Top of funnel"
+        hint={`${tof.length} ads delivering · fatigue threshold 3.5 · judged on cost per lead`}
+      >
+        <AdTable rows={tof.slice(0, 25)} stage="tof" />
+      </Panel>
+
+      <Panel
+        title="Middle of funnel"
+        hint={`${mof.length} ads delivering · fatigue threshold 6.0 · judged against each ad's own history only`}
+      >
+        <div className="mb-4">
+          <Notice tone="accent">
+            MOF ads are compared only to their own history, never to TOF. TOF will always look
+            more expensive per qualified lead because MOF re-touches people prospecting already
+            paid to acquire — benchmarking the two together drains budget out of prospecting.
+          </Notice>
+        </div>
+        <AdTable rows={mof.slice(0, 25)} stage="mof" />
+      </Panel>
+
+      <Panel title="Fatigue review" hint="Watch only — never a kill on frequency alone">
+        {watching.length === 0 ? (
+          <>
+            <Empty>No ads currently over their frequency threshold.</Empty>
+            <Notice>
+              Read this as inconclusive, not clean. The highest 7-day frequency across all 645 ads
+              is 2.50, below even the 3.5 cold threshold — the windowed calculation understates
+              because summed daily reach double-counts repeat viewers. Native Meta frequency would
+              be materially higher. The fatigue and kill rules cannot fire meaningfully until the
+              Marketing API supplies deduplicated 7-day reach.
+            </Notice>
+          </>
+        ) : (
+          <AdTable rows={watching} stage="tof" />
+        )}
+      </Panel>
+
+      <Panel title="Kill candidates" hint="All three conditions must hold simultaneously">
+        {killing.length === 0 ? (
+          <>
+            <Empty>No ads meet all three kill conditions.</Empty>
+            <div className="mt-4">
+              <Notice>
+                Condition 1 (frequency over threshold) currently never fires for the reason above,
+                so no ad can qualify regardless of the other two. For reference, {num(decaying.length)} ads
+                do show CTR decay or cost rise against their own baseline and are listed below —
+                worth a look, but not kills under the rule as specified.
+              </Notice>
+            </div>
+          </>
+        ) : (
+          <AdTable rows={killing} stage="tof" />
+        )}
+      </Panel>
+
+      {killing.length === 0 && decaying.length > 0 && (
+        <Panel title="Degrading against their own baseline" hint="Two of three conditions — informational, not kills">
+          <Table>
+            <thead><tr>
+              <Th>Ad</Th><Th>Stage</Th><Th className="text-right">Lifetime spend</Th>
+              <Th className="text-right">CTR change</Th><Th className="text-right">Cost change</Th>
+              <Th>Conditions met</Th>
+            </tr></thead>
+            <tbody>
+              {decaying
+                .slice()
+                .sort((a, b) => Number(b.lifetime_spend) - Number(a.lifetime_spend))
+                .slice(0, 20)
+                .map((a) => (
+                  <tr key={a.ad_id} className="border-t border-edge">
+                    <Td className="whitespace-normal"><span className="block max-w-[22rem] truncate">{a.ad_name ?? a.ad_id}</span></Td>
+                    <Td><Badge tone={a.funnel_stage === 'mof' ? 'accent' : 'muted'}>{a.funnel_stage}</Badge></Td>
+                    <Td className="tnum text-right">{eur(a.lifetime_spend)}</Td>
+                    <Td className="tnum text-right">{pctBadge(a.ctr_change_pct)}</Td>
+                    <Td className="tnum text-right">{pctBadge(a.cost_change_pct, true)}</Td>
+                    <Td className="text-xs text-muted">
+                      {[a.cond_frequency ? 'frequency' : null,
+                        a.cond_ctr_decay ? 'CTR decay' : null,
+                        a.cond_cost_rise ? 'cost rise' : null]
+                        .filter(Boolean).join(', ')}
+                    </Td>
+                  </tr>
+                ))}
+            </tbody>
+          </Table>
+        </Panel>
+      )}
+
+      <Panel title="What this page cannot tell you">
+        <ul className="space-y-2.5 text-sm">
+          <li className="border-b border-edge pb-2.5">
+            <span className="block">7-day frequency is an approximation</span>
+            <span className="mt-0.5 block text-xs text-muted">
+              Computed as summed impressions divided by summed daily reach. Repeat viewers are
+              counted once per day, so this reads lower than Meta&apos;s deduplicated figure.
+              Fixed by the Marketing API migration.
+            </span>
+          </li>
+          <li className="border-b border-edge pb-2.5">
+            <span className="block">Cost per lead covers a small share of ads</span>
+            <span className="mt-0.5 block text-xs text-muted">
+              Real applications join to ads on utm_content = ad_id, but only
+              {' '}{num(perf.coverage.ads_with_applications)} of 645 ads have any application attached.
+              Most spend therefore has no lead figure at all. Transaction-stage attribution is 2.3%
+              and is not used here.
+            </span>
+          </li>
+          <li>
+            <span className="block">The pipeline runs through a Google Sheet</span>
+            <span className="mt-0.5 block text-xs text-muted">
+              OWOX to Sheet to Apps Script to this database, once daily at 06:00 UTC. If the sheet
+              stops updating this page goes stale silently. Last row: {shortDate(header.latest_date)}.
+            </span>
+          </li>
+        </ul>
+      </Panel>
+    </div>
+  );
+}
