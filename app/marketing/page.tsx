@@ -1,4 +1,5 @@
 import { Panel, Stat, Notice, Table, Th, Td, Badge, Empty } from '@/components/ui';
+import { AdPanel } from '@/components/ad-panel';
 import { getMetaHeader, getAdPerformanceWithLeads, getMofCapTrend } from '@/lib/queries';
 import { eur, num, shortDate } from '@/lib/format';
 
@@ -28,6 +29,7 @@ function AdTable({ rows, stage }: { rows: any[]; stage: 'tof' | 'mof' }) {
     <Table>
       <thead><tr>
         <Th>Ad</Th>
+        <Th>Status</Th>
         <Th className="text-right">Spend 7d</Th>
         <Th className="text-right">Freq 7d</Th>
         <Th className="text-right">CTR vs own baseline</Th>
@@ -46,6 +48,9 @@ function AdTable({ rows, stage }: { rows: any[]; stage: 'tof' | 'mof' }) {
               <Td className="whitespace-normal">
                 <span className="block max-w-[24rem] truncate">{a.ad_name ?? a.ad_id}</span>
                 <span className="mt-0.5 block max-w-[24rem] truncate text-xs text-muted">{a.campaign_name}</span>
+              </Td>
+              <Td>
+                {a.currently_running ? <Badge tone="good">running</Badge> : <Badge tone="muted">off</Badge>}
               </Td>
               <Td className="tnum text-right">{eur(a.spend_7d)}</Td>
               <Td className="tnum text-right">
@@ -107,7 +112,11 @@ export default async function MarketingPage() {
       )}
 
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Stat label="Spend, last 30 days" value={eur(header.spend_30d)} sub={`${num(header.active_ads_30d)} ads delivering`} />
+        <Stat
+          label="Spend, last 30 days"
+          value={eur(header.spend_30d)}
+          sub={`${num(header.active_ads_30d)} ads delivered at some point in the window`}
+        />
         <Stat
           label="MOF share, 30 days"
           value={`${capNow?.mof_pct ?? 0}%`}
@@ -115,7 +124,11 @@ export default async function MarketingPage() {
           sub="Target band 15–25%"
         />
         <Stat label="Blended cost per lead capture" value={eur(header.blended_cpl)} sub="Spend ÷ link clicks, 30 days" />
-        <Stat label="Ads with live delivery" value={num(tof.length + mof.length)} sub={`${num(tof.length)} TOF · ${num(mof.length)} MOF`} />
+        <Stat
+          label="Running today"
+          value={num(header.ads_running_now)}
+          sub={`${shortDate(header.latest_date)} · ${eur(header.spend_latest_day)} spent`}
+        />
       </div>
 
       {!perf.lovable_configured && (
@@ -159,26 +172,9 @@ export default async function MarketingPage() {
         </Table>
       </Panel>
 
-      <Panel
-        title="Top of funnel"
-        hint={`${tof.length} ads delivering · fatigue threshold 3.5 · judged on cost per lead`}
-      >
-        <AdTable rows={tof.slice(0, 25)} stage="tof" />
-      </Panel>
+      <AdPanel stage="tof" rows={tof} latestDate={header.latest_date} />
 
-      <Panel
-        title="Middle of funnel"
-        hint={`${mof.length} ads delivering · fatigue threshold 6.0 · judged against each ad's own history only`}
-      >
-        <div className="mb-4">
-          <Notice tone="accent">
-            MOF ads are compared only to their own history, never to TOF. TOF will always look
-            more expensive per qualified lead because MOF re-touches people prospecting already
-            paid to acquire — benchmarking the two together drains budget out of prospecting.
-          </Notice>
-        </div>
-        <AdTable rows={mof.slice(0, 25)} stage="mof" />
-      </Panel>
+      <AdPanel stage="mof" rows={mof} latestDate={header.latest_date} />
 
       <Panel title="Fatigue review" hint="Watch only — never a kill on frequency alone">
         {watching.length === 0 ? (
@@ -219,7 +215,7 @@ export default async function MarketingPage() {
         <Panel title="Degrading against their own baseline" hint="Two of three conditions — informational, not kills">
           <Table>
             <thead><tr>
-              <Th>Ad</Th><Th>Stage</Th><Th className="text-right">Lifetime spend</Th>
+              <Th>Ad</Th><Th>Stage</Th><Th>Status</Th><Th className="text-right">Lifetime spend</Th>
               <Th className="text-right">CTR change</Th><Th className="text-right">Cost change</Th>
               <Th>Conditions met</Th>
             </tr></thead>
@@ -232,6 +228,7 @@ export default async function MarketingPage() {
                   <tr key={a.ad_id} className="border-t border-edge">
                     <Td className="whitespace-normal"><span className="block max-w-[22rem] truncate">{a.ad_name ?? a.ad_id}</span></Td>
                     <Td><Badge tone={a.funnel_stage === 'mof' ? 'accent' : 'muted'}>{a.funnel_stage}</Badge></Td>
+                    <Td>{a.currently_running ? <Badge tone="good">running</Badge> : <Badge tone="muted">off</Badge>}</Td>
                     <Td className="tnum text-right">{eur(a.lifetime_spend)}</Td>
                     <Td className="tnum text-right">{pctBadge(a.ctr_change_pct)}</Td>
                     <Td className="tnum text-right">{pctBadge(a.cost_change_pct, true)}</Td>
