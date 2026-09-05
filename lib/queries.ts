@@ -9,6 +9,13 @@ import { createLovableClient, lovableConfigured } from '@/lib/supabase/lovable';
  * whop_user_id, live_terms, next_renewal_due. Tier / amount / term_end come
  * from membership_terms, so every member view joins it.
  *
+ * STANDING RULE (2026-09-04): never pull a full table to aggregate in JS.
+ * PostgREST caps responses at 1,000 rows and returns NO error, so the failure
+ * is silent and the number looks wrong-but-plausible. It cost us a EUR 6,550 /
+ * 34.1% MOF reading against a real EUR 68,935 / 40.7%. Any new aggregate gets
+ * a Postgres view. Every raw .from() below is bounded by a filter, a count
+ * head request, or maybeSingle().
+ *
  * Cash uses cash_collected_date (fallback transaction_date), NOT created_at.
  * created_at is row-insert time: the 2026-08-28 backfill stamped 41 historic
  * rows with today's date, so created_at would overstate this month badly.
@@ -73,30 +80,19 @@ export async function getNetNewThisMonth() {
   return count ?? 0;
 }
 
-/** New vs churned per day for the last 30 days. */
+/** New vs churned per day for the last 30 days. Aggregated in Postgres. */
 export async function getGrowthSeries() {
   const supabase = createClient();
-  const from = isoDaysFromNow(-30);
-  const today = isoDaysFromNow(0);
-
-  const [{ data: started }, { data: ended }] = await Promise.all([
-    supabase.from('membership_terms').select('term_start')
-      .eq('status', 'active').gte('term_start', from).lte('term_start', today),
-    supabase.from('membership_terms').select('term_end, extended_to, status')
-      .neq('status', 'active'),
-  ]);
-
-  const days: Record<string, { date: string; joined: number; churned: number }> = {};
-  for (let i = 30; i >= 0; i--) {
-    const d = isoDaysFromNow(-i);
-    days[d] = { date: d, joined: 0, churned: 0 };
-  }
-  (started ?? []).forEach((r: any) => { if (days[r.term_start]) days[r.term_start].joined++; });
-  (ended ?? []).forEach((r: any) => {
-    const d = (r.extended_to ?? r.term_end) as string;
-    if (d && days[d]) days[d].churned++;
-  });
-  return Object.values(days);
+  const { data, error } = await supabase
+    .from('v_growth_30d')
+    .select('date, joined, churned')
+    .order('date', { ascending: true });
+  if (error) return [];
+  return (data ?? []).map((r: any) => ({
+    date: r.date as string,
+    joined: Number(r.joined ?? 0),
+    churned: Number(r.churned ?? 0),
+  }));
 }
 
 export type RenewalRow = {
@@ -228,31 +224,17 @@ export async function getDataQuality() {
 
 export async function getMonthlyCashVsContract() {
   const supabase = createClient();
-  const since = new Date(); since.setMonth(since.getMonth() - 11); since.setDate(1);
-  const from = since.toISOString().slice(0, 10);
-
-  const [{ data: cash }, { data: terms }] = await Promise.all([
-    supabase.from('transactions').select('amount_eur, transaction_date, cash_collected_date')
-      .eq('direction', 'in').eq('category', 'Members Club Revenue')
-      .gte('transaction_date', from),
-    supabase.from('membership_terms').select('amount_eur, term_start').gte('term_start', from),
-  ]);
-
-  const months: Record<string, { month: string; cash: number; contract: number; terms: number }> = {};
-  const key = (d: string) => d.slice(0, 7);
-  for (let i = 11; i >= 0; i--) {
-    const d = new Date(); d.setMonth(d.getMonth() - i); d.setDate(1);
-    months[d.toISOString().slice(0, 7)] = { month: d.toISOString().slice(0, 7), cash: 0, contract: 0, terms: 0 };
-  }
-  (cash ?? []).forEach((r: any) => {
-    const k = key(r.cash_collected_date ?? r.transaction_date);
-    if (months[k]) months[k].cash += Number(r.amount_eur ?? 0);
-  });
-  (terms ?? []).forEach((r: any) => {
-    const k = key(r.term_start);
-    if (months[k]) { months[k].contract += Number(r.amount_eur ?? 0); months[k].terms++; }
-  });
-  return Object.values(months);
+  const { data, error } = await supabase
+    .from('v_monthly_cash_vs_contract')
+    .select('month, cash, contract, terms')
+    .order('month', { ascending: true });
+  if (error) return [];
+  return (data ?? []).map((r: any) => ({
+    month: r.month as string,
+    cash: Number(r.cash ?? 0),
+    contract: Number(r.contract ?? 0),
+    terms: Number(r.terms ?? 0),
+  }));
 }
 
 export type DigestRow = {
@@ -280,63 +262,32 @@ export async function getLatestDigest(): Promise<DigestRow | null> {
  * ------------------------------------------------------------------ */
 
 /**
- * Net-new vs renewal, split rather than blended.
- * "New" = the person's first ever term. "Renewal" = any later term for a
- * person who already had one. Blending the two makes growth and retention
- * indistinguishable, so they are always returned separately.
+ * Net-new vs renewal, split rather than blended, aggregated in Postgres.
+ * "New" = the person's first ever term. Blending the two makes growth and
+ * retention indistinguishable, so they are always returned separately.
+ *
+ * Excludes not_a_membership and paid_not_in_ledger, per the 2026-09-04 rule.
  */
 export async function getNewVsRenewal() {
   const supabase = createClient();
-  const { start, end } = monthBounds();
+  const { data } = await supabase
+    .from('v_new_vs_renewal')
+    .select('*')
+    .maybeSingle();
 
-  const { data: all } = await supabase
-    .from('membership_terms')
-    .select('person_id, term_start, amount_eur, status, term_months, extended_to, term_end');
-
-  const rows = (all ?? []) as any[];
-
-  // Earliest term per person decides new vs renewal.
-  const firstStart: Record<string, string> = {};
-  for (const r of rows) {
-    if (!r.term_start) continue;
-    const cur = firstStart[r.person_id];
-    if (!cur || r.term_start < cur) firstStart[r.person_id] = r.term_start;
-  }
-
-  const from = start.slice(0, 10);
-  const to = end.slice(0, 10);
-  const thisMonth = rows.filter(
-    (r) => r.term_start && r.term_start >= from && r.term_start < to && r.status === 'active'
-  );
-
-  const isNew = (r: any) => r.term_start === firstStart[r.person_id];
-  const sum = (list: any[]) => list.reduce((t, r) => t + Number(r.amount_eur ?? 0), 0);
-
-  const newTerms = thisMonth.filter(isNew);
-  const renewalTerms = thisMonth.filter((r) => !isNew(r));
-
-  const today = isoDaysFromNow(0);
-  const live = rows.filter(
-    (r) => r.status === 'active' && (r.extended_to ?? r.term_end) >= today
-  );
-
+  const r = (data ?? {}) as any;
   return {
-    month: from.slice(0, 7),
-    net_new_count: newTerms.length,
-    net_new_eur: sum(newTerms),
-    renewal_count: renewalTerms.length,
-    renewal_eur: sum(renewalTerms),
-    // Live book, for context beside the monthly figures.
-    live_terms: live.length,
-    live_new: live.filter(isNew).length,
-    live_renewal: live.filter((r) => !isNew(r)).length,
-    live_contract_value: sum(live),
-    avg_term_value: live.length ? sum(live) / live.length : 0,
-    // Annualised from each term's own length, not assumed to be 12 months.
-    arr: live.reduce(
-      (t, r) => t + (Number(r.amount_eur ?? 0) * 12) / (Number(r.term_months) || 12),
-      0
-    ),
+    month: r.month ?? '',
+    net_new_count: Number(r.net_new_count ?? 0),
+    net_new_eur: Number(r.net_new_eur ?? 0),
+    renewal_count: Number(r.renewal_count ?? 0),
+    renewal_eur: Number(r.renewal_eur ?? 0),
+    live_terms: Number(r.live_terms ?? 0),
+    live_new: Number(r.live_new ?? 0),
+    live_renewal: Number(r.live_renewal ?? 0),
+    live_contract_value: Number(r.live_contract_value ?? 0),
+    avg_term_value: Number(r.avg_term_value ?? 0),
+    arr: Number(r.arr ?? 0),
   };
 }
 
@@ -360,7 +311,8 @@ export async function getAttributionCoverage() {
     transaction_total: txTotal ?? 0,
     transaction_tagged: txTagged ?? 0,
     transaction_pct: pct(txTagged ?? 0, txTotal ?? 0),
-    // Application-stage lives in the Lovable project. Verified 2026-09-04.
+    // Application-stage lives in the Lovable project, which this app does not
+    // connect to. Verified 2026-09-04: 161 of 399 = 40.4%.
     application_total: 399,
     application_tagged: 161,
     application_pct: 40.4,
@@ -379,27 +331,23 @@ export async function getRenewalBoundaryDrift() {
 
 export async function getMetaHeader() {
   const supabase = createClient();
-  const from = isoDaysFromNow(-30);
-
   const { data } = await supabase
-    .from('meta_ad_daily')
-    .select('ad_id, date_start, spend_eur, inline_link_clicks')
-    .gte('date_start', from);
+    .from('v_meta_header_30d')
+    .select('spend_30d, active_ads_30d, link_clicks_30d, blended_cpl, latest_date, ads_running_now, spend_latest_day')
+    .maybeSingle();
 
-  const rows = (data ?? []) as any[];
-  const spend = rows.reduce((t, r) => t + Number(r.spend_eur ?? 0), 0);
-  const captures = rows.reduce((t, r) => t + Number(r.inline_link_clicks ?? 0), 0);
-
-  const { data: last } = await supabase
-    .from('meta_ad_daily').select('date_start')
-    .order('date_start', { ascending: false }).limit(1).maybeSingle();
-
+  const r = (data ?? {}) as any;
   return {
-    spend_30d: spend,
-    active_ads_30d: new Set(rows.map((r) => r.ad_id)).size,
+    spend_30d: Number(r.spend_30d ?? 0),
+    active_ads_30d: Number(r.active_ads_30d ?? 0),
     // Link clicks stand in for lead captures. Not real leads - see the UI note.
-    blended_cpl: captures > 0 ? spend / captures : 0,
-    latest_date: last?.date_start ?? null,
+    blended_cpl: Number(r.blended_cpl ?? 0),
+    latest_date: r.latest_date ?? null,
+    // Ads with a row on the single most recent date_start - i.e. live today.
+    // Distinct from active_ads_30d, which counts anything that delivered at
+    // any point in the window including ads switched off weeks ago.
+    ads_running_now: Number(r.ads_running_now ?? 0),
+    spend_latest_day: Number(r.spend_latest_day ?? 0),
   };
 }
 
@@ -412,38 +360,28 @@ export async function getAdPerformance() {
 }
 
 /**
- * MOF share across three windows. The trend matters more than the point
- * reading, so all three are returned together and rendered side by side.
+ * MOF share across three windows, aggregated in Postgres.
+ *
+ * DO NOT pull meta_ad_daily rows and sum them client-side. PostgREST caps at
+ * 1,000 rows by default and returns no error, which silently produced a
+ * EUR 6,550 / 34.1% reading against a real EUR 68,935 / 40.7%.
  */
 export async function getMofCapTrend() {
   const supabase = createClient();
-  const { data } = await supabase
-    .from('meta_ad_daily')
-    .select('date_start, spend_eur, funnel_stage');
+  const { data, error } = await supabase
+    .from('v_meta_mof_cap')
+    .select('window_key, label, sort_order, total_spend, mof_spend, mof_pct')
+    .order('sort_order', { ascending: true });
 
-  const rows = (data ?? []) as any[];
-  const d30 = isoDaysFromNow(-30);
-  const d90 = isoDaysFromNow(-90);
+  if (error) return [];
 
-  const windows = [
-    { window: '30d', label: 'Last 30 days', test: (d: string) => d >= d30 },
-    { window: '90d', label: 'Last 90 days', test: (d: string) => d >= d90 },
-    { window: 'all', label: 'All time', test: () => true },
-  ];
-
-  return windows.map((w) => {
-    const inWindow = rows.filter((r) => w.test(r.date_start));
-    const total = inWindow.reduce((t, r) => t + Number(r.spend_eur ?? 0), 0);
-    const mof = inWindow.filter((r) => r.funnel_stage === 'mof')
-                        .reduce((t, r) => t + Number(r.spend_eur ?? 0), 0);
-    return {
-      window: w.window,
-      label: w.label,
-      total,
-      mof,
-      mof_pct: total > 0 ? Math.round((mof / total) * 1000) / 10 : 0,
-    };
-  });
+  return (data ?? []).map((r: any) => ({
+    window: r.window_key,
+    label: r.label,
+    total: Number(r.total_spend ?? 0),
+    mof: Number(r.mof_spend ?? 0),
+    mof_pct: Number(r.mof_pct ?? 0),
+  }));
 }
 
 /* ---------------- real cost-per-lead, Lovable join ---------------- */
@@ -451,45 +389,48 @@ export async function getMofCapTrend() {
 /**
  * Applications per ad, from the Lovable project.
  *
+ * READS A VIEW, NOT THE TABLE. application_partials has anon INSERT and UPDATE
+ * policies but no SELECT policy, so querying it directly returned zero rows
+ * with no error. v_applications_by_ad exposes counts grouped by ad id only -
+ * no names, emails or phone numbers can leave through it.
+ *
  * JOIN KEY, verified 2026-09-04 against live data:
  *   application_partials.utm_content  = meta_ad_daily.ad_id
  *   application_partials.utm_term     = adset_id   (NOT the ad)
  *   application_partials.utm_campaign = campaign_id
- * All 12 ad ids appearing in applications matched meta_ad_daily exactly.
  *
  * Qualified = the top three revenue bands, a controlled dropdown.
  */
 export async function getApplicationsByAd() {
-  if (!lovableConfigured()) {
-    return { configured: false, byAd: {} as Record<string, { leads: number; qualified: number }>,
-             total_apps: 0, apps_with_ad: 0 };
-  }
+  const empty = {
+    configured: false,
+    byAd: {} as Record<string, { leads: number; qualified: number }>,
+    total_apps: 0, apps_with_ad: 0, ads_with_applications: 0,
+  };
+  if (!lovableConfigured()) return empty;
+
   const supabase = createLovableClient()!;
 
-  const { data, error } = await supabase
-    .from('application_partials')
-    .select('utm_content, revenue, completed');
+  const [{ data: perAd, error: adErr }, { data: cov }] = await Promise.all([
+    supabase.from('v_applications_by_ad').select('ad_id, leads, qualified_leads'),
+    supabase.from('v_application_coverage')
+      .select('total_apps, apps_with_ad_id, ads_with_applications').maybeSingle(),
+  ]);
 
-  if (error) {
-    return { configured: true, byAd: {} as Record<string, { leads: number; qualified: number }>,
-             total_apps: 0, apps_with_ad: 0, error: error.message };
-  }
-
-  const QUALIFIED = new Set(['€25-100K/M', '€100-500K/M', '€500K+/M']);
-  const isAdId = (v: unknown) => typeof v === 'string' && /^[0-9]{15,20}$/.test(v);
+  if (adErr) return { ...empty, configured: true, error: adErr.message };
 
   const byAd: Record<string, { leads: number; qualified: number }> = {};
-  let withAd = 0;
-
-  for (const r of (data ?? []) as any[]) {
-    if (!isAdId(r.utm_content)) continue;
-    withAd++;
-    byAd[r.utm_content] ??= { leads: 0, qualified: 0 };
-    byAd[r.utm_content].leads++;
-    if (QUALIFIED.has(r.revenue)) byAd[r.utm_content].qualified++;
+  for (const r of (perAd ?? []) as any[]) {
+    byAd[r.ad_id] = { leads: Number(r.leads ?? 0), qualified: Number(r.qualified_leads ?? 0) };
   }
 
-  return { configured: true, byAd, total_apps: (data ?? []).length, apps_with_ad: withAd };
+  return {
+    configured: true,
+    byAd,
+    total_apps: Number(cov?.total_apps ?? 0),
+    apps_with_ad: Number(cov?.apps_with_ad_id ?? 0),
+    ads_with_applications: Number(cov?.ads_with_applications ?? Object.keys(byAd).length),
+  };
 }
 
 /**
@@ -505,7 +446,7 @@ export async function getAdPerformanceWithLeads() {
     coverage: {
       total_apps: apps.total_apps,
       apps_with_ad_id: apps.apps_with_ad,
-      ads_with_applications: Object.keys(apps.byAd).length,
+      ads_with_applications: apps.ads_with_applications,
     },
     rows: ads.map((a: any) => {
       const app = apps.byAd[a.ad_id];
